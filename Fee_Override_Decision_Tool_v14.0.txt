@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Amazon Fee Override Pro Tool
 // @namespace    http://tampermonkey.net/
-// @version      13.0
-// @description  v11.7: Migrated from deprecated hubble.amazon.dev to DataCentral Workbench (datacentral.a2z.com/workbench). Both URLs supported during transition period.
+// @version      14.0
+// @description  v14.0: Reverted to direct fee category file upload approach. DataCentral/Redshift batch query removed. Upload XLSX/CSV with current fee categories once — used across all tickets.
 // @match        https://t.corp.amazon.com/*
 // @match        https://datacentral.a2z.com/*
 // @match        https://crisp.cors.amazon.dev/*
@@ -13,19 +13,20 @@
 // @grant        GM_getValue
 // @grant        GM_deleteValue
 // @grant        GM_addStyle
+// @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // ==/UserScript==
 
 /* ============================================================
-   HOW THIS WORKS (v13)
+   HOW THIS WORKS (v14)
    ─────────────────────────────────────────────────────────────
-   MORNING SETUP (Once for all 80 tickets):
-     1. User uploads daily ASIN file (xlsx or csv) with
-        columns: ASIN, Marketplace_ID
-     2. Script reads all ASIN+Marketplace pairs
-     3. Builds one DataCentral query with all ASINs
-     4. Opens DataCentral, runs query once
-     5. Captures all current fee categories
-     6. Stores in GM_setValue (persists across sessions)
+   ONE-TIME SETUP (Upload once — remembered across sessions):
+     1. User uploads the current fee category file (XLSX or CSV)
+        with columns: marketplace_id, asin, fee_category_name
+        (extra columns like fee_category_id, trex_id etc. are
+        safely ignored — only asin, marketplace_id,
+        fee_category_name are read)
+     2. Script extracts and caches those 3 fields per row
+     3. Stored in GM_setValue (persists across sessions)
 
    DURING TICKET PROCESSING (No DataCentral needed):
      1. Open any ticket
@@ -224,7 +225,112 @@
         }
 
         // ─────────────────────────────────────────────────────
-        // BUILD DataCentral QUERY from ASIN pairs
+        // LOAD CURRENT FEE CATEGORY FILE (XLSX or CSV)
+        // Reads ONLY: asin, marketplace_id, fee_category_name
+        // All other columns are safely ignored
+        // ─────────────────────────────────────────────────────
+        async function loadFeeCategoryFile(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const name = file.name.toLowerCase();
+            const isXlsx = name.endsWith('.xlsx') || name.endsWith('.xls');
+            const isCsv  = name.endsWith('.csv');
+
+            if (!isXlsx && !isCsv) {
+                setCategoryStatus('❌ Please upload a CSV or XLSX file.', '#dc2626');
+                e.target.value = '';
+                return;
+            }
+
+            setCategoryStatus('⏳ Reading file...', '#d97706');
+
+            try {
+                let rows = [];
+
+                if (isXlsx) {
+                    const buffer = await readFileAsBuffer(file);
+                    const wb = XLSX.read(buffer, { type: 'array' });
+                    const ws = wb.Sheets[wb.SheetNames[0]];
+                    rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+                } else {
+                    const text = await readFileAsText(file);
+                    rows = csvToJson(text);
+                }
+
+                if (!rows.length) {
+                    setCategoryStatus('❌ No data found in file.', '#dc2626');
+                    e.target.value = '';
+                    return;
+                }
+
+                // Extract ONLY asin, marketplace_id, fee_category_name — ignore everything else
+                const extracted = [];
+                for (const row of rows) {
+                    const keys = Object.keys(row);
+                    const asinKey = keys.find(k => k.trim().toLowerCase() === 'asin');
+                    const mpKey = keys.find(k => k.trim().toLowerCase() === 'marketplace_id');
+                    const catKey = keys.find(k => k.trim().toLowerCase() === 'fee_category_name');
+
+                    const asin = (asinKey ? String(row[asinKey]) : '').trim();
+                    const marketplace_id = (mpKey ? String(row[mpKey]) : '').trim();
+                    const fee_category_name = (catKey ? String(row[catKey]) : '').trim();
+
+                    if (asin && marketplace_id) {
+                        extracted.push({ asin, marketplace_id, fee_category_name });
+                    }
+                }
+
+                if (!extracted.length) {
+                    setCategoryStatus('❌ No valid rows found. Ensure columns are named asin, marketplace_id, fee_category_name.', '#dc2626');
+                    e.target.value = '';
+                    return;
+                }
+
+                // Deduplicate by asin + marketplace_id
+                const seen = new Set();
+                const unique = [];
+                for (const item of extracted) {
+                    const key = item.asin + '|' + item.marketplace_id;
+                    if (!seen.has(key)) { seen.add(key); unique.push(item); }
+                }
+
+                cachedAsins = unique;
+                await saveData('feeOverride_asinCache', unique);
+                await saveData('feeOverride_cacheTime', {
+                    time    : new Date().toLocaleString(),
+                    count   : unique.length,
+                    fileName: file.name
+                });
+
+                updateCacheStatus();
+                setCategoryStatus(`✅ Loaded ${unique.length} ASINs from "${file.name}"`, '#15803d');
+
+            } catch (err) {
+                setCategoryStatus('❌ Error reading file: ' + err.message, '#dc2626');
+            }
+
+            e.target.value = '';
+        }
+
+        function readFileAsBuffer(file) {
+            return new Promise((resolve, reject) => {
+                const r = new FileReader();
+                r.onload = () => resolve(new Uint8Array(r.result));
+                r.onerror = () => reject(new Error('Failed to read file'));
+                r.readAsArrayBuffer(file);
+            });
+        }
+
+        function setCategoryStatus(msg, color) {
+            const el = document.getElementById('fotCategoryStatus');
+            if (el) { el.textContent = msg; el.style.color = color || '#1d4ed8'; }
+        }
+
+        // ─────────────────────────────────────────────────────
+        // [REMOVED in v14] buildBatchQuery, loadBatchFile,
+        // extractPairs, runBatchHubble, startPolling
+        // DataCentral/Redshift approach discontinued.
         // ─────────────────────────────────────────────────────
         function buildBatchQuery(pairs, snapshotOffset = 4) {
             // pairs = [{ asin, marketplace_id }, ...]
@@ -293,88 +399,6 @@ LEFT JOIN fee_cat_mapping f
 ORDER BY a.marketplace_id, a.asin;`;
         }
 
-        // ─────────────────────────────────────────────────────
-        // LOAD DAILY ASIN BATCH FILE (CSV only)
-        // ─────────────────────────────────────────────────────
-        async function loadBatchFile(e) {
-            const file = e.target.files[0];
-            if (!file) return;
-
-            if (!file.name.toLowerCase().endsWith('.csv')) {
-                setBatchStatus('❌ Please upload a CSV file. To convert: open your Excel file → File → Save As → CSV (Comma delimited).', '#dc2626');
-                e.target.value = '';
-                return;
-            }
-
-            setBatchStatus('⏳ Reading file...', '#d97706');
-
-            try {
-                let pairs = [];
-                const text = await readFileAsText(file);
-                const rows = csvToJson(text);
-                pairs = extractPairs(rows);
-
-                if (!pairs.length) {
-                    setBatchStatus('❌ No valid ASIN + Marketplace_ID pairs found in file.', '#dc2626');
-                    return;
-                }
-
-                // Remove duplicates
-                const unique = [];
-                const seen = new Set();
-                for (const p of pairs) {
-                    const key = p.asin + '|' + p.marketplace_id;
-                    if (!seen.has(key)) { seen.add(key); unique.push(p); }
-                }
-
-                setBatchStatus(`✅ File loaded: ${unique.length} unique ASIN pairs found. Click "Run Batch DataCentral Query" to fetch fee categories.`, '#15803d');
-                updateBatchCount(unique.length);
-
-                // Store pairs temporarily for the DataCentral run
-                await saveData('feeOverride_batchPairs', unique);
-
-            } catch (err) {
-                setBatchStatus('❌ Error reading file: ' + err.message, '#dc2626');
-            }
-
-            // Reset file input so same file can be re-uploaded if needed
-            e.target.value = '';
-        }
-
-        function extractPairs(rows) {
-            const pairs = [];
-            for (const row of rows) {
-                // Find ASIN column — matches any column containing "asin" in its name
-                const asinKey = Object.keys(row).find(k => k.toLowerCase().includes('asin'));
-                const rawAsin = (asinKey ? row[asinKey] : '').trim();
-
-                // Find Marketplace column — matches any column containing "marketplace" in its name
-                const mpKey = Object.keys(row).find(k => k.toLowerCase().includes('marketplace'));
-                const mp = String(mpKey ? row[mpKey] : '').trim();
-
-                if (!mp) continue;
-
-        // Check if the ASIN cell contains multiple ASINs
-        // (separated by commas, spaces, or newlines)
-                const asinPattern = /B0[A-Z0-9]{8,9}/gi;
-                const foundAsins = rawAsin.match(asinPattern);
-
-        if (foundAsins && foundAsins.length > 1) {
-            // Multiple ASINs in one cell — split and pair each with same marketplace
-            for (const asin of foundAsins) {
-                pairs.push({ asin: asin.toUpperCase(), marketplace_id: mp });
-            }
-        } else if (foundAsins && foundAsins.length === 1) {
-            // Single ASIN — normal case
-            pairs.push({ asin: foundAsins[0].toUpperCase(), marketplace_id: mp });
-        } else if (rawAsin) {
-            // Fallback — use as is (handles edge cases)
-            pairs.push({ asin: rawAsin.toUpperCase(), marketplace_id: mp });
-        }
-    }
-    return pairs.filter(p => p.asin && p.marketplace_id);
-}
-
         function readFileAsText(file) {
             return new Promise((resolve, reject) => {
                 const r = new FileReader();
@@ -382,121 +406,6 @@ ORDER BY a.marketplace_id, a.asin;`;
                 r.onerror = () => reject(new Error('Failed to read file'));
                 r.readAsText(file);
             });
-        }
-
-        // ─────────────────────────────────────────────────────
-        // RUN BATCH DataCentral QUERY
-        // ─────────────────────────────────────────────────────
-        async function runBatchHubble() {
-            const pairs = await loadData('feeOverride_batchPairs');
-
-            if (!pairs || !pairs.length) {
-                setBatchStatus('❌ Please upload the daily ASIN file first.', '#dc2626');
-                return;
-            }
-
-
-
-            const query = buildBatchQuery(pairs);
-
-            // Store job for DataCentral tab
-            // Start with offset 2 — DataCentral side will auto retry with 3, 4 if empty
-            await GM_setValue('hubbleJob_query', query);
-            await GM_setValue('hubbleJob_status', 'pending');
-            await GM_setValue('hubbleJob_result', '');
-            await GM_setValue('hubbleJob_error', '');
-            await GM_setValue('hubbleJob_snapshotDay', '');
-            await GM_setValue('hubbleJob_pairs', JSON.stringify(pairs));
-
-            setBatchStatus(`⏳ Opening DataCentral for ${pairs.length} ASINs... please wait, do not close the DataCentral tab.`, '#d97706');
-
-            window.open('https://datacentral.a2z.com/workbench', '_blank');
-
-            startPolling(pairs.length);
-        }
-
-        // ─────────────────────────────────────────────────────
-        // POLL FOR DataCentral RESULTS
-        // ─────────────────────────────────────────────────────
-        function startPolling(totalAsins) {
-            if (pollTimer) clearInterval(pollTimer);
-
-            let elapsed = 0;
-            const MAX = 1200; // polling timeout
-
-            pollTimer = setInterval(async () => {
-                elapsed += 3;
-
-                const status = await GM_getValue('hubbleJob_status', '');
-                const error = await GM_getValue('hubbleJob_error', '');
-
-                if (status === 'done') {
-                    clearInterval(pollTimer);
-                    pollTimer = null;
-
-                    const raw = await GM_getValue('hubbleJob_result', '');
-                    if (!raw) {
-                        setBatchStatus('❌ DataCentral returned empty results. Try changing snapshot_day to -3 or -4.', '#dc2626');
-                        return;
-                    }
-
-                    try {
-                        const fetched = JSON.parse(raw);
-                        const snapshotDay = await GM_getValue('hubbleJob_snapshotDay', '');
-
-                        // Merge with existing cache (in case of partial re-runs)
-                        const existing = cachedAsins || [];
-                        const mergedMap = new Map();
-
-                        // Add existing first
-                        for (const item of existing) {
-                            const key = item.asin + '|' + item.marketplace_id;
-                            mergedMap.set(key, item);
-                        }
-                        // Overwrite/add new fetched data
-                        for (const item of fetched) {
-                            const key = item.asin + '|' + item.marketplace_id;
-                            mergedMap.set(key, item);
-                        }
-
-                        cachedAsins = [...mergedMap.values()];
-
-                        // Save with timestamp and snapshot day
-                        await saveData('feeOverride_asinCache', cachedAsins);
-                        await saveData('feeOverride_cacheTime', {
-                            time        : new Date().toLocaleString(),
-                            count       : cachedAsins.length,
-                            snapshotDay : snapshotDay
-                        });
-
-                        updateCacheStatus();
-                        setBatchStatus(
-                            `✅ Done! ${fetched.length} ASINs fetched from DataCentral. Total cache: ${cachedAsins.length} ASINs. You can now process all tickets.` +
-                            (snapshotDay ? ` · Snapshot Day: ${snapshotDay}` : ''),
-                            '#15803d'
-                        );
-
-                    } catch (e) {
-                        setBatchStatus('❌ Failed to parse DataCentral results: ' + e.message, '#dc2626');
-                    }
-
-                } else if (status === 'error') {
-                    clearInterval(pollTimer);
-                    pollTimer = null;
-                    setBatchStatus('❌ DataCentral error: ' + error, '#dc2626');
-
-                } else if (elapsed >= MAX) {
-                    clearInterval(pollTimer);
-                    pollTimer = null;
-                    setBatchStatus('❌ Timed out. DataCentral took too long. Try again or reduce ASIN count.', '#dc2626');
-
-                } else {
-                    // Show chunk progress if available
-                    const chunkInfo = status.startsWith('running|') ? status.replace('running|', '') : '';
-                    const chunkMsg = chunkInfo ? ` — ${chunkInfo}` : '';
-                    setBatchStatus(`⏳ Fetching ${totalAsins} ASINs from DataCentral${chunkMsg}... (${elapsed}s elapsed)`, '#d97706');
-                }
-            }, 3000);
         }
 
         // ─────────────────────────────────────────────────────
@@ -534,13 +443,12 @@ ORDER BY a.marketplace_id, a.asin;`;
 
 
         async function clearCache() {
-            if (!confirm('Clear the ASIN cache? You will need to run the batch DataCentral query again.')) return;
+            if (!confirm('Clear the fee category data? You will need to re-upload the file.')) return;
             cachedAsins = [];
             await clearData('feeOverride_asinCache');
             await clearData('feeOverride_cacheTime');
-            await clearData('feeOverride_batchPairs');
             updateCacheStatus();
-            setBatchStatus('🗑️ Cache cleared. Please upload the daily ASIN file and run the batch query again.', '#6b7280');
+            setCategoryStatus('🗑️ Cleared. Please re-upload the fee category file.', '#6b7280');
         }
 
         function downloadCache() {
@@ -633,19 +541,9 @@ if (sellerIdMatch && sellerIdMatch[1]) {
             el.innerHTML = html;
         }
 
-        function setBatchStatus(msg, color) {
-            const el = document.getElementById('fotBatchStatus');
-            if (el) { el.textContent = msg; el.style.color = color || '#1d4ed8'; }
-        }
-
         function updateFeeStatus() {
             const el = document.getElementById('fotFeeStatus');
             if (el) el.textContent = feeData.length ? `✅ Loaded: ${feeData.length} rows` : '⚠️ Not loaded';
-        }
-
-        function updateBatchCount(count) {
-            const el = document.getElementById('fotBatchCount');
-            if (el) el.textContent = count ? `📋 ${count} ASIN pairs ready` : '';
         }
 
         async function updateCacheStatus() {
@@ -653,12 +551,12 @@ if (sellerIdMatch && sellerIdMatch[1]) {
             const el = document.getElementById('fotCacheStatus');
             if (!el) return;
             if (cachedAsins.length) {
-               el.innerHTML = `✅ Cache: <b>${cachedAsins.length}</b> ASINs stored` +
-    (meta ? ` · Last updated: ${meta.time}` : '') +
-    (meta?.snapshotDay ? ` · Snapshot Day: ${meta.snapshotDay}` : '');
+                el.innerHTML = `✅ <b>${cachedAsins.length}</b> ASINs loaded` +
+                    (meta ? ` · Updated: ${meta.time}` : '') +
+                    (meta?.fileName ? ` · File: ${meta.fileName}` : '');
                 el.style.color = '#15803d';
             } else {
-                el.textContent = '⚠️ No cache yet — run batch query first';
+                el.textContent = '⚠️ No data yet — upload fee category file first';
                 el.style.color = '#d97706';
             }
         }
@@ -854,7 +752,7 @@ if (sellerIdMatch && sellerIdMatch[1]) {
             }
 
             if (!cachedAsins.length) {
-                show('❌ No ASIN cache found. Please upload the daily ASIN file and run the batch DataCentral query first.', '#dc2626');
+                show('❌ No fee category data found. Please upload the current fee category file first (Step 1).', '#dc2626');
                 return;
             }
 
@@ -1011,7 +909,7 @@ if (sellerIdMatch && sellerIdMatch[1]) {
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
                     <div>
                         <div style="font-size:24px;font-weight:800;color:#111827;">Fee Override Decision Tool</div>
-                        <div style="font-size:12px;color:#6b7280;">Smart Fee Category Assessor · v13.0</div>
+                        <div style="font-size:12px;color:#6b7280;">Smart Fee Category Assessor · v14.0</div>
                     </div>
                     <div style="display:flex;gap:8px;">
                         <button id="fotToggle" style="width:42px;height:42px;border:none;border-radius:12px;background:#2563eb;color:#fff;font-size:24px;cursor:pointer;font-weight:700;">−</button>
@@ -1032,37 +930,24 @@ if (sellerIdMatch && sellerIdMatch[1]) {
                         </div>
                     </div>
 
-                    <!-- STEP 1: DAILY BATCH UPLOAD -->
+                    <!-- STEP 1: CURRENT FEE CATEGORY FILE -->
                     <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:14px;padding:14px;margin-bottom:12px;">
-                        <div style="font-weight:700;color:#15803d;margin-bottom:4px;">📂 Step 1 — Upload Daily ASIN Batch File</div>
+                        <div style="font-weight:700;color:#15803d;margin-bottom:4px;">📂 Step 1 — Upload Current Fee Category File</div>
                         <div style="font-size:12px;color:#16a34a;margin-bottom:10px;">
-                            Upload the daily file with <b>ASIN</b> and <b>Marketplace_ID</b> columns (CSV format). Do this once every morning.
+                            Upload the fee category file (<b>XLSX or CSV</b>) with columns: <b>asin</b>, <b>marketplace_id</b>, <b>fee_category_name</b>. Extra columns are ignored. Upload once — remembered across sessions.
                         </div>
-                        <input type="file" id="fotBatchFile" accept=".csv" style="margin-bottom:8px;">
-                        <div id="fotBatchCount" style="font-size:12px;color:#15803d;margin-bottom:8px;"></div>
-
-                        <button id="fotRunBatchBtn" style="
-                            width:100%;padding:11px;
-                            background:linear-gradient(135deg,#16a34a,#15803d);
-                            color:#fff;border:none;border-radius:10px;
-                            font-size:14px;font-weight:700;cursor:pointer;margin-bottom:8px;
-                        ">🚀 Run Batch DataCentral Query (Once for All Tickets)</button>
-
-                        <div id="fotBatchStatus" style="font-size:12px;min-height:18px;font-weight:600;word-break:break-word;"></div>
+                        <input type="file" id="fotCategoryFile" accept=".csv,.xlsx,.xls" style="margin-bottom:8px;">
+                        <div id="fotCategoryStatus" style="font-size:12px;font-weight:600;margin-top:4px;min-height:16px;word-break:break-word;"></div>
+                        <div id="fotCacheStatus" style="font-size:12px;font-weight:600;margin-top:6px;min-height:16px;"></div>
+                        <div style="margin-top:10px;display:flex;gap:8px;">
+                            <button id="fotClearCacheBtn" class="fotMiniBtn" style="font-size:12px;">🗑️ Clear</button>
+                            <button id="fotDownloadCacheBtn" class="fotMiniBtn" style="font-size:12px;">⬇️ Download</button>
+                        </div>
                     </div>
 
-                    <!-- STEP 2: CACHE STATUS -->
-                    <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:14px;padding:14px;margin-bottom:12px;">
-                        <div style="font-weight:700;color:#1d4ed8;margin-bottom:6px;">🗄️ Step 2 — ASIN Cache Status</div>
-                        <div id="fotCacheStatus" style="font-size:13px;font-weight:600;margin-bottom:8px;"></div>
-                        <button id="fotClearCacheBtn" class="fotMiniBtn" style="font-size:12px;">🗑️ Clear Cache</button>
-                        <button id="fotDownloadCacheBtn" class="fotMiniBtn" style="font-size:12px;margin-left:8px;">⬇️ Download Cache</button>
-
-                    </div>
-
-                    <!-- STEP 3: FEES MASTER FILE -->
+                    <!-- STEP 2: FEES MASTER FILE -->
                     <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-bottom:14px;">
-                        <div style="font-weight:700;margin-bottom:4px;">📄 Step 3 — Fees Master File</div>
+                        <div style="font-weight:700;margin-bottom:4px;">📄 Step 2 — Fees Master File</div>
                         <div style="font-size:12px;color:#6b7280;margin-bottom:8px;">Upload once — remembered across sessions. (CSV format only)</div>
                         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
                             <input type="file" id="fotFeeFile" accept=".csv">
@@ -1071,9 +956,9 @@ if (sellerIdMatch && sellerIdMatch[1]) {
                         <div id="fotFeeStatus" style="color:#16a34a;font-size:12px;margin-top:8px;"></div>
                     </div>
 
-                    <!-- STEP 4: ASIN PROCESSOR (BadCat & CRISP) -->
+                    <!-- STEP 3: ASIN PROCESSOR (BadCat & CRISP) -->
                     <div style="background:#f0f4ff;border:1px solid #c7d2fe;border-radius:14px;padding:14px;margin-bottom:14px;">
-                        <div style="font-weight:700;color:#3730a3;margin-bottom:4px;">🔗 Step 4 — ASIN Processor</div>
+                        <div style="font-weight:700;color:#3730a3;margin-bottom:4px;">🔗 Step 3 — ASIN Processor</div>
                         <div style="font-size:12px;color:#4338ca;margin-bottom:10px;">
                             Open <b>BadCat</b> fee override tool or <b>CRISP</b> ASIN viewer directly for ticket ASINs. No juggling between tools!
                         </div>
@@ -1142,8 +1027,7 @@ if (sellerIdMatch && sellerIdMatch[1]) {
                 else { body.style.display = 'none'; btn.textContent = '+'; }
             };
 
-            document.getElementById('fotBatchFile').addEventListener('change', loadBatchFile);
-            document.getElementById('fotRunBatchBtn').onclick = runBatchHubble;
+            document.getElementById('fotCategoryFile').addEventListener('change', loadFeeCategoryFile);
             document.getElementById('fotClearCacheBtn').onclick = clearCache;
             document.getElementById('fotDownloadCacheBtn').onclick = downloadCache;
             document.getElementById('fotFeeFile').addEventListener('change', loadFeeFile);
