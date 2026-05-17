@@ -451,48 +451,7 @@ ORDER BY a.marketplace_id, a.asin;`;
             setCategoryStatus('🗑️ Cleared. Please re-upload the fee category file.', '#6b7280');
         }
 
-        function downloadCache() {
-    if (!cachedAsins.length) {
-        alert('No cache data to download.');
-        return;
-    }
-
-    // Load the original batch pairs to identify missing ASINs
-    loadData('feeOverride_batchPairs').then(batchPairs => {
-        const rows = ['ASIN,Marketplace_ID,Fee_Category_Name,Status'];
-
-        // Add retrieved ASINs
-        for (const item of cachedAsins) {
-            const asin = item.asin || '';
-            const mp = item.marketplace_id || '';
-            const cat = (item.fee_category_name || '').replace(/,/g, ';');
-            rows.push(`${asin},${mp},${cat},Retrieved`);
-        }
-
-        // Add missing ASINs if batch pairs exist
-        if (batchPairs && batchPairs.length) {
-            const retrievedKeys = new Set(
-                cachedAsins.map(item => item.asin + '|' + item.marketplace_id)
-            );
-            for (const pair of batchPairs) {
-                const key = pair.asin + '|' + pair.marketplace_id;
-                if (!retrievedKeys.has(key)) {
-                    rows.push(`${pair.asin},${pair.marketplace_id},NOT FOUND,Missing`);
-                }
-            }
-        }
-
-        const csv = rows.join('\n');
-        const blob = new Blob([csv], { type: 'text/csv' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `fee_override_cache_${new Date().toISOString().slice(0,10)}.csv`;
-        a.click();
-        URL.revokeObjectURL(url);
-    });
-}
-
+        
         // ─────────────────────────────────────────────────────
         // PAGE READER
         // ─────────────────────────────────────────────────────
@@ -941,7 +900,6 @@ if (sellerIdMatch && sellerIdMatch[1]) {
                         <div id="fotCacheStatus" style="font-size:12px;font-weight:600;margin-top:6px;min-height:16px;"></div>
                         <div style="margin-top:10px;display:flex;gap:8px;">
                             <button id="fotClearCacheBtn" class="fotMiniBtn" style="font-size:12px;">🗑️ Clear</button>
-                            <button id="fotDownloadCacheBtn" class="fotMiniBtn" style="font-size:12px;">⬇️ Download</button>
                         </div>
                     </div>
 
@@ -1029,7 +987,6 @@ if (sellerIdMatch && sellerIdMatch[1]) {
 
             document.getElementById('fotCategoryFile').addEventListener('change', loadFeeCategoryFile);
             document.getElementById('fotClearCacheBtn').onclick = clearCache;
-            document.getElementById('fotDownloadCacheBtn').onclick = downloadCache;
             document.getElementById('fotFeeFile').addEventListener('change', loadFeeFile);
             document.getElementById('fotClearFee').onclick = clearFeeFile;
             document.getElementById('fotAsinFileInput').addEventListener('change', fotHandleAsinFileUpload);
